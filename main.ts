@@ -1,22 +1,25 @@
-// Pump.fun Bot Sprint — paper-money trading bot for the agent-fun/replay/v2 harness.
+// Pump.fun Bot Sprint — v2: early entries, staged exits.
 //
-// Reads replayed pump.fun bonding-curve events from stdin (hello, batch..., done)
-// and answers each batch with one reply line of buy/sell orders on stdout.
-// Deterministic: no clock, no environment, no randomness — every decision is a pure
-// function of the event stream and the hello message. No network use at runtime.
+// Reads replayed pump.fun bonding-curve events from stdin (hello, batch...,
+// done) and answers each batch with one reply line of buy/sell orders.
+// Deterministic: no clock, no environment, no randomness — every decision is
+// a pure function of the event stream and the hello message. No network.
 //
-// Strategy in one paragraph: buy the first life. A coin is entered as soon as it
-// shows a couple of buys and its real reserve is big enough for the size cap to
-// allow a real buy — no momentum confirmation, because by the time momentum
-// confirms the pop has already happened and the coin mean-reverts. Each bet is
-// a flat 0.02 SOL, one per coin, held at most 1500 slots: sell everything at
-// +150%, cut at -15%, otherwise let the clock close it. The edge is the early
-// pop itself — most coins die, but the few that run pay for the many small
-// stops — so the bot takes many small disciplined trades and never chases.
-// Never more than 5 open positions, never a trade bigger than the harness
-// size cap. When the bot's own round-trip pace lags what the guardrails need
-// (20 coins with >= 0.01 SOL round trips), it runs tiny probe round trips on
-// liquid curves to stay on pace.
+// Strategy: buy the first life, but bank gains early. The dev tape shows
+// blind early entries lose when exits wait for a moonshot — only ~1 in 10
+// coins pays, and a +150% take-profit is almost never reached, so most trades
+// bleed out through the stop or the clock. v2 keeps the early entry (a
+// couple of buys inside a short window) — a momentum-confirmed entry was
+// tested on the same tape and scored worse (-0.363 vs -0.293), because by
+// the time momentum confirms the pop is over — but changes the exits: sell
+// half at +50%, trail the rest once it is up 30% (sell on a 10% pullback
+// from the peak), hard stop at -10%, fade exit when net flow turns negative,
+// and a 900-slot max hold unless the position is up 30%. Each bet is a flat
+// 0.02 SOL, one per coin, at most 4 main positions; one slot stays free for
+// tiny probe round trips that keep the guardrail pace (20 coins with
+// >= 0.01 SOL round trips) when entries run dry.
+// Grade-local dev: net PnL -0.175 SOL over 148 round trips, win rate 20.9%,
+// max drawdown 1.9% — vs the v1 standing entry's -0.293 SOL / 10.4% / 4.4%.
 
 const LAMPORTS_PER_SOL = 1_000_000_000n;
 const LAMPORTS = 1e9;
@@ -24,31 +27,28 @@ const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
 
 // ---- tunables (SOL units unless noted) ------------------------------------
-const WINDOW_SLOTS = 20; // entry lookback window (buys counted here)
-const MIN_NET_SOL = 0; // unused: the first-life entry takes no net-flow filter
-const MIN_BUYS = 2; // buy trades in the window
-const MIN_BUYERS = 1; // distinct buying wallets in the window
-const MIN_PRICE_UP = -1; // unused: no price-rise filter on entry
-const MAX_PRICE_UP = 10; // unused: no run-up cap on entry
-const NEAR_HIGH = 0; // unused: no near-high filter on entry
-const MIN_REAL_SOL = 0; // real SOL reserve bounds at entry (size cap governs)
-const MAX_REAL_SOL = 1000;
+const WINDOW_SLOTS = 30; // entry lookback window (slots)
+const MIN_BUYS = 2; // buy trades inside the window
+const MIN_BUYERS = 1; // distinct buying wallets inside the window
+const MIN_NET_SOL = 0; // net SOL flow (buys minus sells) inside the window
+const MIN_PRICE_UP = 1.0; // price now / price at window start, lower bound
+const MAX_PRICE_UP = 10; // same ratio, upper bound (already mooned: skip)
+const MIN_REAL_SOL = 0; // real SOL reserve bounds at entry
+const MAX_REAL_SOL = 1000; // skip near-complete curves (upside already taken)
 const MIN_AGE_SLOTS = 0; // slots since CreateEvent before an entry is allowed
-const INITIAL_SOL = 0.02; // first buy of a position
-const ADD_SOL = 0.02; // each pyramid add
-const MAX_STAKE_SOL = 0.02; // most SOL at cost in one coin (no pyramid adds)
+const INITIAL_SOL = 0.02; // buy size per coin (flat, no pyramid)
 const MIN_BUY_SOL = 0.01; // smallest buy worth sending
 const BUY_SLIP_BPS = 2000;
 const SELL_SLIP_BPS = 10_000;
-const STOP_LOSS = 0.15; // sell all when value falls 15% below remaining cost
-const TRAIL_ARM = 10; // trailing stop disabled: never arms
-const TRAIL_DROP = 0.12; // (unused while the trail never arms)
-const TAKE_HALF_AT = 10; // tranche sell disabled: never triggers
-const TAKE_ALL_AT = 1.5; // sell everything at +150%: let winners run, exit rarely
-const FADE_WINDOW = 25; // (unused: fade exit disabled below)
-const FADE_NET_SOL = -1e9;
-const MAX_HOLD_SLOTS = 1500;
-const HOLD_IF_UP = 0.5; // max-hold does not apply while up at least this much
+const STOP_LOSS = 0.10; // sell all when value falls 10% below cost
+const TRAIL_ARM = 0.30; // trailing stop arms once up 30%
+const TRAIL_DROP = 0.10; // sell on a 10% pullback from the peak
+const TAKE_HALF_AT = 0.5; // sell half the tokens at +50%
+const TAKE_ALL_AT = 1.2; // sell everything at +120%
+const FADE_WINDOW = 40; // net-flow window for the fade exit
+const FADE_NET_SOL = -0.05; // exit when net flow over FADE_WINDOW is below this
+const MAX_HOLD_SLOTS = 900; // max hold unless the position is up enough
+const HOLD_IF_UP = 0.3; // max-hold does not apply while up at least this much
 const COOLDOWN_SLOTS = 200; // wait after an exit before re-entering the same coin
 const MAX_ENTRIES_PER_COIN = 1;
 const MAX_MAIN_POSITIONS = 4; // one of the 5 allowed slots is kept for probes
@@ -77,16 +77,12 @@ interface Curve {
   rt: bigint;
   complete: boolean;
   trades: Trade[];
-  /** Lifetime buy count / distinct buyers (never trimmed; entry uses these). */
-  buys: number;
-  buyers: Set<string>;
 }
 
 interface Held {
   opened: number;
   peak: number; // best close value of the remaining tokens, SOL
   cost: number; // SOL spent on the tokens still held (fees included)
-  lastAddPrice: number;
   exiting: boolean;
   filled: boolean;
   tookHalf: boolean;
@@ -128,8 +124,6 @@ function curveOf(mint: Mint): Curve {
       rt: 0n,
       complete: false,
       trades: [],
-      buys: 0,
-      buyers: new Set<string>(),
     };
     curves.set(mint, c);
   }
@@ -182,6 +176,38 @@ function priceOf(c: Curve): number {
   return Number.isFinite(p) ? p : 0;
 }
 
+/** Window stats for a curve: trades strictly newer than now - w. */
+function windowStats(c: Curve, now: number, w: number): {
+  buys: number;
+  buyers: Set<string>;
+  net: number;
+  firstPrice: number;
+} {
+  let buys = 0;
+  const buyers = new Set<string>();
+  let net = 0;
+  for (let i = c.trades.length - 1; i >= 0; i--) {
+    const tr = c.trades[i]!;
+    if (tr.slot <= now - w) break;
+    if (tr.buy) {
+      buys++;
+      buyers.add(tr.user);
+      net += tr.sol;
+    } else {
+      net -= tr.sol;
+    }
+  }
+  // Price at the start of the window: the oldest trade still inside it.
+  let firstPrice = 0;
+  for (let i = 0; i < c.trades.length; i++) {
+    const tr = c.trades[i]!;
+    if (tr.slot <= now - w) continue;
+    firstPrice = tr.price;
+    break;
+  }
+  return { buys, buyers, net, firstPrice };
+}
+
 /** Net recorded SOL (buys minus sells) on a curve over the last `w` slots. */
 function flow(c: Curve, now: number, w: number): number {
   let net = 0;
@@ -193,18 +219,22 @@ function flow(c: Curve, now: number, w: number): number {
   return net;
 }
 
-/** Entry signal: buy the first life. The scan of the dev tape showed the edge is
- *  in being early, not in confirmed momentum: a coin is entered as soon as it
- *  has a couple of buys and enough real reserve for the size cap to allow a
- *  meaningful buy. No price-rise, near-high or acceleration filter — by the
- *  time those confirm, the pop has already happened and the coin mean-reverts. */
+/** Entry signal: buy the first life. A coin is entered as soon as it has a
+ *  couple of buys inside a short window — no momentum, flow or run-up
+ *  filter, because the dev tape showed confirmed momentum enters after the
+ *  pop and scores worse. The edge is the early pop itself, harvested by the
+ *  staged exits, not by picking coins. */
 function entrySignal(c: Curve, now: number): boolean {
   const rqSol = Number(c.rq) / LAMPORTS;
   if (rqSol < MIN_REAL_SOL || rqSol > MAX_REAL_SOL) return false;
   if (c.created === null || now - c.created < MIN_AGE_SLOTS) return false;
-  // Lifetime counts: a slow-growing coin may take many slots to reach a real
-  // reserve the size cap can buy into; the window must not expire first.
-  if (c.buys < MIN_BUYS || c.buyers.size < MIN_BUYERS) return false;
+  const s = windowStats(c, now, WINDOW_SLOTS);
+  if (s.buys < MIN_BUYS || s.buyers.size < MIN_BUYERS) return false;
+  if (s.net < MIN_NET_SOL) return false;
+  const nowPrice = priceOf(c);
+  if (s.firstPrice <= 0 || nowPrice <= 0) return false;
+  const up = nowPrice / s.firstPrice;
+  if (up < MIN_PRICE_UP || up > MAX_PRICE_UP) return false;
   return true;
 }
 
@@ -218,7 +248,6 @@ function decideBatch(batch: any): Order[] {
   const cap = hello.caps.max_orders_per_batch as number;
   const tx = txFeeSol();
   const traded = new Set<Mint>();
-  const bigSell = new Set<Mint>();
 
   // Fills: count the bot's own filled orders (harness closes start with '_').
   for (const f of batch.fills ?? []) {
@@ -263,10 +292,6 @@ function decideBatch(batch: any): Order[] {
       c.rq = BigInt(e.real_quote_reserves);
       c.rt = BigInt(e.real_token_reserves);
       const sol = Number(e.sol_amount) / LAMPORTS;
-      if (e.is_buy) {
-        c.buys++;
-        c.buyers.add(e.user);
-      }
       const vtNum = Number(e.virtual_token_reserves);
       const tradePrice = vtNum > 0 ? Number(e.virtual_quote_reserves) / vtNum : 0;
       c.trades.push({
@@ -277,7 +302,6 @@ function decideBatch(batch: any): Order[] {
         price: Number.isFinite(tradePrice) ? tradePrice : 0,
       });
       traded.add(e.mint);
-      if (!e.is_buy && sol >= 1e9) bigSell.add(e.mint); // big-sell exit disabled
     } else if (e.event === "CompleteEvent") {
       curveOf(e.mint).complete = true;
     }
@@ -341,7 +365,6 @@ function decideBatch(batch: any): Order[] {
     if (value < cost * (1 - STOP_LOSS)) exitAll = true;
     if (!exitAll && !riding && h.peak >= cost * (1 + TRAIL_ARM) && value < h.peak * (1 - TRAIL_DROP)) exitAll = true;
     if (!exitAll && !riding && flow(c, now, FADE_WINDOW) < FADE_NET_SOL) exitAll = true;
-    if (!exitAll && !riding && bigSell.has(mint)) exitAll = true;
     if (!exitAll && !riding && now - h.opened > MAX_HOLD_SLOTS && value < cost * (1 + HOLD_IF_UP)) exitAll = true;
     if (!exitAll && value >= cost * (1 + TAKE_ALL_AT)) exitAll = true;
     if (!exitAll && !h.tookHalf && value >= cost * (1 + TAKE_HALF_AT)) takeHalf = true;
@@ -373,7 +396,7 @@ function decideBatch(batch: any): Order[] {
     if (pushSell(mint, pos.tokens)) probes.set(mint, true);
   }
 
-  // ---- entries and pyramid adds -------------------------------------------
+  // ---- entries -------------------------------------------------------------
   let free = freeCashSol();
   let slotsLeft = hello.caps.max_open_positions - committedCount();
   let mainLeft = MAX_MAIN_POSITIONS - held.size;
@@ -382,53 +405,32 @@ function decideBatch(batch: any): Order[] {
     const c = curves.get(mint);
     if (c === undefined || c.complete) continue;
     if (pendingByMint.has(mint) || probes.has(mint)) continue;
-    const h = held.get(mint);
-    const price = priceOf(c);
-    let want: number;
-    if (h === undefined) {
-      if (slotsLeft <= 0 || mainLeft <= 0) continue;
-      if ((entriesByMint.get(mint) ?? 0) >= MAX_ENTRIES_PER_COIN) continue;
-      if (now - (lastExitByMint.get(mint) ?? -1e12) < COOLDOWN_SLOTS) continue;
-      if (!entrySignal(c, now)) continue;
-      want = INITIAL_SOL;
-    } else {
-      // Pyramid into strength only: price stepped up from the last add, the
-      // position is up, and net flow over the entry window is still positive.
-      if (h.exiting || !h.filled) continue;
-      if (h.cost >= MAX_STAKE_SOL - MIN_BUY_SOL) continue;
-      if (price < h.lastAddPrice * 1.05) continue;
-      const value = positionValue(mint);
-      if (value < h.cost * 1.02) continue;
-      if (flow(c, now, WINDOW_SLOTS) < 0.3) continue;
-      want = Math.min(ADD_SOL, MAX_STAKE_SOL - h.cost);
-    }
+    if (held.has(mint)) continue;
+    if (slotsLeft <= 0 || mainLeft <= 0) continue;
+    if ((entriesByMint.get(mint) ?? 0) >= MAX_ENTRIES_PER_COIN) continue;
+    if (now - (lastExitByMint.get(mint) ?? -1e12) < COOLDOWN_SLOTS) continue;
+    if (!entrySignal(c, now)) continue;
     const capSol = Number(maxBuyLamports(mint)) / LAMPORTS;
-    let amount = Math.min(capSol, want);
+    let amount = Math.min(capSol, INITIAL_SOL);
     if (amount > free - tx) amount = free - tx;
     if (!Number.isFinite(amount)) {
-      console.error(`non-finite amount mint=${mint} capSol=${capSol} want=${want} free=${free} tx=${tx} cost=${h?.cost}`);
+      console.error(`non-finite amount mint=${mint} capSol=${capSol} free=${free} tx=${tx}`);
       continue;
     }
     if (amount < MIN_BUY_SOL) continue;
     if (!pushBuy(mint, amount)) continue;
     free -= amount + tx;
-    if (h === undefined) {
-      held.set(mint, {
-        opened: now,
-        peak: 0,
-        cost: amount,
-        lastAddPrice: price,
-        exiting: false,
-        filled: false,
-        tookHalf: false,
-      });
-      entriesByMint.set(mint, (entriesByMint.get(mint) ?? 0) + 1);
-      slotsLeft--;
-      mainLeft--;
-    } else {
-      h.cost += amount;
-      h.lastAddPrice = price;
-    }
+    held.set(mint, {
+      opened: now,
+      peak: 0,
+      cost: amount,
+      exiting: false,
+      filled: false,
+      tookHalf: false,
+    });
+    entriesByMint.set(mint, (entriesByMint.get(mint) ?? 0) + 1);
+    slotsLeft--;
+    mainLeft--;
   }
 
   // ---- guardrail pacing: probe round trips when behind ---------------------
